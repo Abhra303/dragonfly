@@ -18,6 +18,7 @@
 
 ABSL_DECLARE_FLAG(uint32_t, multi_exec_mode);
 ABSL_DECLARE_FLAG(bool, multi_exec_squash);
+ABSL_DECLARE_FLAG(bool, lua_auto_async);
 ABSL_DECLARE_FLAG(std::string, default_lua_flags);
 
 namespace dfly {
@@ -661,8 +662,6 @@ TEST_F(MultiTest, ContendedList) {
     return;
   }
 
-  GTEST_SKIP() << "Test fails, we need to check why";
-
   constexpr int listSize = 50;
   constexpr int stepSize = 5;
 
@@ -690,11 +689,12 @@ TEST_F(MultiTest, ContendedList) {
   f2.Join();
 
   for (int i = 0; i < listSize; i++) {
-    EXPECT_EQ(Run({"lpop", "l1"}), "a");
-    EXPECT_EQ(Run({"lpop", "l2"}), "b");
+    EXPECT_EQ(Run({"lpop", "l1-out"}), "a");
+    EXPECT_EQ(Run({"lpop", "l2-out"}), "b");
   }
-  EXPECT_EQ(Run({"llen", "chan-1"}), "0");
-  EXPECT_EQ(Run({"llen", "chan-2"}), "0");
+
+  EXPECT_THAT(Run({"llen", "chan-1"}), IntArg(0));
+  EXPECT_THAT(Run({"llen", "chan-2"}), IntArg(0));
 }
 
 // Test that squashing makes single-key ops atomic withing a non-atomic tx
@@ -725,6 +725,111 @@ TEST_F(MultiTest, TestSquashing) {
 
   done.store(true);
   f1.Join();
+}
+
+TEST_F(MultiTest, MultiLeavesTxQueue) {
+  if (auto mode = absl::GetFlag(FLAGS_multi_exec_mode); mode == Transaction::NON_ATOMIC) {
+    GTEST_SKIP() << "Skipped MultiLeavesTxQueue test because multi_exec_mode is non atomic";
+    return;
+  }
+
+  // Tests the scenario, where the OOO multi-tx is scheduled into tx queue and there is another
+  // tx (mget) after it that runs and tests for atomicity.
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_multi_exec_squash, false);
+
+  for (unsigned i = 0; i < 20; ++i) {
+    string key = StrCat("x", i);
+    LOG(INFO) << key << ": shard " << Shard(key, shard_set->size());
+  }
+
+  Run({"mget", "x5", "x8", "x9", "x13", "x16", "x17"});
+  ASSERT_EQ(1, GetDebugInfo().shards_count);
+
+  auto fb1 = pp_->at(1)->LaunchFiber(Launch::post, [&] {
+    // Runs multi on shard0 1000 times.
+    for (unsigned j = 0; j < 1000; ++j) {
+      Run({"multi"});
+      Run({"incrby", "x13", "1"});
+      Run({"incrby", "x16", "1"});
+      Run({"incrby", "x17", "1"});
+      Run({"exec"});
+    }
+  });
+
+  auto fb2 = pp_->at(2)->LaunchFiber(Launch::dispatch, [&] {
+    // Runs multi on shard0 1000 times.
+    for (unsigned j = 0; j < 1000; ++j) {
+      Run({"multi"});
+      Run({"incrby", "x5", "1"});
+      Run({"incrby", "x8", "1"});
+      Run({"incrby", "x9", "1"});
+      Run({"exec"});
+    }
+  });
+
+  auto check_triple = [](const RespExpr::Vec& arr, unsigned start) {
+    if (arr[start].type != arr[start + 1].type || arr[start + 1].type != arr[start + 2].type) {
+      return false;
+    }
+
+    if (arr[0].type == RespExpr::STRING) {
+      string s0 = arr[start].GetString();
+      string s1 = arr[start + 1].GetString();
+      string s2 = arr[start + 2].GetString();
+      if (s0 != s1 || s1 != s2) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  bool success = pp_->at(0)->Await([&]() -> bool {
+    for (unsigned j = 0; j < 1000; ++j) {
+      auto resp = Run({"mget", "x5", "x8", "x9", "x13", "x16", "x17"});
+      const RespExpr::Vec& arr = resp.GetVec();
+      CHECK_EQ(6u, arr.size());
+
+      if (!check_triple(arr, 0)) {
+        LOG(ERROR) << "inconsistent " << arr[0] << " " << arr[1] << " " << arr[2];
+        return false;
+      }
+      if (!check_triple(arr, 3)) {
+        LOG(ERROR) << "inconsistent " << arr[3] << " " << arr[4] << " " << arr[5];
+        return false;
+      }
+    }
+    return true;
+  });
+
+  fb1.Join();
+  fb2.Join();
+  ASSERT_TRUE(success);
+}
+
+TEST_F(MultiTest, TestLockedKeys) {
+  if (auto mode = absl::GetFlag(FLAGS_multi_exec_mode); mode != Transaction::LOCK_AHEAD) {
+    GTEST_SKIP() << "Skipped TestLockedKeys test because multi_exec_mode is not lock ahead";
+    return;
+  }
+
+  TransactionSuspension tx;
+  tx.Start();
+
+  auto fb0 = pp_->at(0)->LaunchFiber([&] {
+    EXPECT_EQ(Run({"multi"}), "OK");
+    EXPECT_EQ(Run({"set", "key1", "val1"}), "QUEUED");
+    EXPECT_EQ(Run({"set", "key2", "val2"}), "QUEUED");
+    EXPECT_THAT(Run({"exec"}), RespArray(ElementsAre("OK", "OK")));
+  });
+
+  ExpectConditionWithinTimeout(
+      [&]() { return service_->IsLocked(0, "key1") && service_->IsLocked(0, "key2"); });
+
+  tx.Terminate();
+  fb0.Join();
+  EXPECT_FALSE(service_->IsLocked(0, "key1"));
+  EXPECT_FALSE(service_->IsLocked(0, "key1"));
 }
 
 class MultiEvalTest : public BaseFamilyTest {
@@ -780,6 +885,25 @@ TEST_F(MultiEvalTest, MultiSomeEval) {
   EXPECT_THAT(exec_resp.GetVec(), ElementsAre(IntArg(1), "y"));
 
   EXPECT_THAT(brpop_resp, ArgType(RespExpr::NIL_ARRAY));
+}
+
+TEST_F(MultiEvalTest, ScriptSquashingUknownCmd) {
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_lua_auto_async, true);
+
+  // The script below contains two commands for which execution can't even be prepared
+  // (FIRST/SECOND WRONG). The first is issued with pcall, so its error should be completely
+  // ignored, the second one should cause an abort and no further commands should be executed
+  string_view s = R"(
+    redis.pcall('INCR', 'A')
+    redis.pcall('FIRST WRONG')
+    redis.pcall('INCR', 'A')
+    redis.call('SECOND WRONG')
+    redis.pcall('INCR', 'A')
+  )";
+
+  EXPECT_THAT(Run({"EVAL", s, "1", "A"}), ErrArg("unknown command `SECOND WRONG`"));
+  EXPECT_EQ(Run({"get", "A"}), "2");
 }
 
 }  // namespace dfly

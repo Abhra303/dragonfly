@@ -23,7 +23,9 @@ extern "C" {
 
 #include "base/flags.h"
 #include "base/logging.h"
+#include "croncpp.h"  // cron::cronexpr
 #include "facade/dragonfly_connection.h"
+#include "facade/reply_builder.h"
 #include "io/file_util.h"
 #include "io/proc_reader.h"
 #include "server/command_registry.h"
@@ -36,6 +38,7 @@ extern "C" {
 #include "server/journal/journal.h"
 #include "server/main_service.h"
 #include "server/memory_cmd.h"
+#include "server/protocol_client.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/script_mgr.h"
@@ -52,6 +55,18 @@ extern "C" {
 
 using namespace std;
 
+struct ReplicaOfFlag {
+  string host;
+  string port;
+
+  bool has_value() const {
+    return !host.empty() && !port.empty();
+  }
+};
+
+static bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err);
+static std::string AbslUnparseFlag(const ReplicaOfFlag& flag);
+
 ABSL_FLAG(string, dir, "", "working directory");
 ABSL_FLAG(string, dbfilename, "dump-{timestamp}", "the filename to save/load the DB");
 ABSL_FLAG(string, requirepass, "",
@@ -59,15 +74,72 @@ ABSL_FLAG(string, requirepass, "",
           "If empty can also be set with DFLY_PASSWORD environment variable.");
 ABSL_FLAG(string, save_schedule, "",
           "glob spec for the UTC time to save a snapshot which matches HH:MM 24h time");
+ABSL_FLAG(string, snapshot_cron, "",
+          "cron expression for the time to save a snapshot, crontab style");
 ABSL_FLAG(bool, df_snapshot_format, true,
           "if true, save in dragonfly-specific snapshotting format");
 ABSL_FLAG(int, epoll_file_threads, 0,
           "thread size for file workers when running in epoll mode, default is hardware concurrent "
           "threads");
+ABSL_FLAG(ReplicaOfFlag, replicaof, ReplicaOfFlag{},
+          "Specifies a host and port which point to a target master "
+          "to replicate. "
+          "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>");
 
 ABSL_DECLARE_FLAG(uint32_t, port);
 ABSL_DECLARE_FLAG(bool, cache_mode);
 ABSL_DECLARE_FLAG(uint32_t, hz);
+ABSL_DECLARE_FLAG(bool, tls);
+ABSL_DECLARE_FLAG(string, tls_ca_cert_file);
+ABSL_DECLARE_FLAG(string, tls_ca_cert_dir);
+
+bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
+#define RETURN_ON_ERROR(cond, m)                                           \
+  do {                                                                     \
+    if ((cond)) {                                                          \
+      *err = m;                                                            \
+      LOG(WARNING) << "Error in parsing arguments for --replicaof: " << m; \
+      return false;                                                        \
+    }                                                                      \
+  } while (0)
+
+  if (in.empty()) {  // on empty flag "parse" nothing. If we return false then DF exists.
+    *flag = ReplicaOfFlag{};
+    return true;
+  }
+
+  auto pos = in.find_last_of(':');
+  RETURN_ON_ERROR(pos == string::npos, "missing ':'.");
+
+  string_view ip = in.substr(0, pos);
+  flag->port = in.substr(pos + 1);
+
+  RETURN_ON_ERROR(ip.empty() || flag->port.empty(), "IP/host or port are empty.");
+
+  // For IPv6: ip1.front == '[' AND ip1.back == ']'
+  // For IPv4: ip1.front != '[' AND ip1.back != ']'
+  // Together, this ip1.front == '[' iff ip1.back == ']', which can be implemented as XNOR (NOT XOR)
+  RETURN_ON_ERROR(((ip.front() == '[') ^ (ip.back() == ']')), "unclosed brackets.");
+
+  if (ip.front() == '[') {
+    // shortest possible IPv6 is '::1' (loopback)
+    RETURN_ON_ERROR(ip.length() <= 2, "IPv6 host name is too short");
+
+    flag->host = ip.substr(1, ip.length() - 2);
+    VLOG(1) << "received IP of type IPv6: " << flag->host;
+  } else {
+    flag->host = ip;
+    VLOG(1) << "received IP of type IPv4 (or a host): " << flag->host;
+  }
+
+  VLOG(1) << "--replicaof: Received " << flag->host << " :  " << flag->port;
+  return true;
+#undef RETURN_ON_ERROR
+}
+
+std::string AbslUnparseFlag(const ReplicaOfFlag& flag) {
+  return (flag.has_value()) ? absl::StrCat(flag.host, ":", flag.port) : "";
+}
 
 namespace dfly {
 
@@ -365,14 +437,15 @@ string FormatTs(absl::Time now) {
   return absl::FormatTime("%Y-%m-%dT%H:%M:%S", now, absl::LocalTimeZone());
 }
 
-void ExtendDfsFilename(absl::AlphaNum postfix, fs::path* filename) {
+// modifies 'filename' to be "filename-postfix.extension"
+void SetExtension(absl::AlphaNum postfix, string_view extension, fs::path* filename) {
   filename->replace_extension();  // clear if exists
-  *filename += StrCat("-", postfix, ".dfs");
+  *filename += StrCat("-", postfix, extension);
 }
 
-void ExtendDfsFilenameWithShard(int shard, fs::path* filename) {
+void ExtendDfsFilenameWithShard(int shard, string_view extension, fs::path* filename) {
   // dragonfly snapshot.
-  ExtendDfsFilename(absl::Dec(shard, absl::kZeroPad4), filename);
+  SetExtension(absl::Dec(shard, absl::kZeroPad4), extension, filename);
 }
 
 GenericError ValidateFilename(const fs::path& filename, bool new_version) {
@@ -380,7 +453,7 @@ GenericError ValidateFilename(const fs::path& filename, bool new_version) {
 
   if (!filename.parent_path().empty() && !is_cloud_path) {
     return {absl::StrCat("filename may not contain directory separators (Got \"", filename.c_str(),
-                         "\")")};
+                         "\"). dbfilename should specify the filename without the directory")};
   }
 
   if (!filename.has_extension()) {
@@ -417,6 +490,36 @@ void SlowLog(CmdArgList args, ConnectionContext* cntx) {
   }
 
   (*cntx)->SendError(UnknownSubCmd(sub_cmd, "SLOWLOG"), kSyntaxErrType);
+}
+
+// Check that if TLS is used at least one form of client authentication is
+// enabled. That means either using a password or giving a root
+// certificate for authenticating client certificates which will
+// be required.
+void ValidateServerTlsFlags() {
+  if (!absl::GetFlag(FLAGS_tls)) {
+    return;
+  }
+
+  bool has_auth = false;
+
+  if (!dfly::GetPassword().empty()) {
+    has_auth = true;
+  }
+
+  if (!(absl::GetFlag(FLAGS_tls_ca_cert_file).empty() &&
+        absl::GetFlag(FLAGS_tls_ca_cert_dir).empty())) {
+    has_auth = true;
+  }
+
+  if (!has_auth) {
+    LOG(ERROR) << "TLS configured but no authentication method is used!";
+    exit(1);
+  }
+}
+
+bool IsReplicatingNoOne(string_view host, string_view port) {
+  return absl::EqualsIgnoreCase(host, "no") && absl::EqualsIgnoreCase(port, "one");
 }
 
 }  // namespace
@@ -470,6 +573,39 @@ bool DoesTimeMatchSpecifier(const SnapshotSpec& spec, time_t now) {
          DoesTimeNibbleMatchSpecifier(spec.minute_spec, min);
 }
 
+std::optional<cron::cronexpr> InferSnapshotCronExpr() {
+  string save_time = GetFlag(FLAGS_save_schedule);
+  string snapshot_cron_exp = GetFlag(FLAGS_snapshot_cron);
+
+  if (!snapshot_cron_exp.empty() && !save_time.empty()) {
+    LOG(ERROR) << "snapshot_cron and save_schedule flags should not be set simultaneously";
+    quick_exit(1);
+  }
+
+  string raw_cron_expr;
+  if (!save_time.empty()) {
+    std::optional<SnapshotSpec> spec = ParseSaveSchedule(save_time);
+
+    if (spec) {
+      // Setting snapshot to HH:mm everyday, as specified by `save_schedule` flag
+      raw_cron_expr = "0 " + spec.value().minute_spec + " " + spec.value().hour_spec + " * * *";
+    } else {
+      LOG(WARNING) << "Invalid snapshot time specifier " << save_time;
+    }
+  } else if (!snapshot_cron_exp.empty()) {
+    raw_cron_expr = "0 " + snapshot_cron_exp;
+  }
+
+  if (!raw_cron_expr.empty()) {
+    try {
+      return std::optional<cron::cronexpr>(cron::make_cron(raw_cron_expr));
+    } catch (const cron::bad_cronexpr& ex) {
+      LOG(WARNING) << "Invalid cron expression: " << ex.what();
+    }
+  }
+  return std::nullopt;
+}
+
 ServerFamily::ServerFamily(Service* service) : service_(*service) {
   start_time_ = time(NULL);
   last_save_info_ = make_shared<LastSaveInfo>();
@@ -488,18 +624,19 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
     LOG(ERROR) << ec.Format();
     exit(1);
   }
+
+  ValidateServerTlsFlags();
+  ValidateClientTlsFlags();
 }
 
 ServerFamily::~ServerFamily() {
 }
 
-void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners,
-                        ClusterFamily* cluster_family) {
+void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
   CHECK(acceptor_ == nullptr);
   acceptor_ = acceptor;
   listeners_ = std::move(listeners);
   dfly_cmd_ = make_unique<DflyCmd>(this);
-  cluster_family_ = cluster_family;
 
   pb_task_ = shard_set->pool()->GetNextProactor();
   if (pb_task_->GetKind() == ProactorBase::EPOLL) {
@@ -526,6 +663,13 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   stats_caching_task_ =
       pb_task_->AwaitBrief([&] { return pb_task_->AddPeriodic(period_ms, cache_cb); });
 
+  // check for '--replicaof' before loading anything
+  if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
+    service_.proactor_pool().GetNextProactor()->Await(
+        [this, &flag]() { this->Replicate(flag.host, flag.port); });
+    return;  // DONT load any snapshots
+  }
+
   string flag_dir = GetFlag(FLAGS_dir);
   if (IsCloudPath(flag_dir)) {
     aws_ = make_unique<cloud::AWS>("s3");
@@ -539,16 +683,8 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
     load_result_ = Load(load_path);
   }
 
-  string save_time = GetFlag(FLAGS_save_schedule);
-  if (!save_time.empty()) {
-    std::optional<SnapshotSpec> spec = ParseSaveSchedule(save_time);
-    if (spec) {
-      snapshot_schedule_fb_ = service_.proactor_pool().GetNextProactor()->LaunchFiber(
-          [save_spec = std::move(spec.value()), this] { SnapshotScheduling(save_spec); });
-    } else {
-      LOG(WARNING) << "Invalid snapshot time specifier " << save_time;
-    }
-  }
+  snapshot_schedule_fb_ =
+      service_.proactor_pool().GetNextProactor()->LaunchFiber([this] { SnapshotScheduling(); });
 }
 
 void ServerFamily::Shutdown() {
@@ -689,30 +825,24 @@ Future<std::error_code> ServerFamily::Load(const std::string& load_path) {
   return ec_future;
 }
 
-void ServerFamily::SnapshotScheduling(const SnapshotSpec& spec) {
-  const auto loop_sleep_time = std::chrono::seconds(20);
+void ServerFamily::SnapshotScheduling() {
+  const std::optional<cron::cronexpr> cron_expr = InferSnapshotCronExpr();
+  if (!cron_expr) {
+    return;
+  }
+
+  const auto loading_check_interval = std::chrono::seconds(10);
+  while (service_.GetGlobalState() == GlobalState::LOADING) {
+    schedule_done_.WaitFor(loading_check_interval);
+  }
+
   while (true) {
-    if (schedule_done_.WaitFor(loop_sleep_time)) {
+    const std::chrono::time_point now = std::chrono::system_clock::now();
+    const std::chrono::time_point next = cron::cron_next(cron_expr.value(), now);
+
+    if (schedule_done_.WaitFor(next - now)) {
       break;
-    }
-
-    time_t now = std::time(NULL);
-
-    if (!DoesTimeMatchSpecifier(spec, now)) {
-      continue;
-    }
-
-    // if it matches check the last save time, if it is the same minute don't save another
-    // snapshot
-    time_t last_save;
-    {
-      lock_guard lk(save_mu_);
-      last_save = last_save_info_->save_time;
-    }
-
-    if ((last_save / 60) == (now / 60)) {
-      continue;
-    }
+    };
 
     GenericError ec = DoSave();
     if (ec) {
@@ -887,10 +1017,10 @@ void PrintPrometheusMetrics(const Metrics& m, StringResponse* resp) {
     AppendMetricHeader("commands", "Metrics for all commands ran", MetricType::COUNTER,
                        &command_metrics);
     for (const auto& [name, stat] : commands) {
-      const auto calls = stat.first, sum = stat.second;
-      AppendMetricValue(StrCat("cmd_", name, "_calls"), calls, {}, {}, &command_metrics);
-      AppendMetricValue(StrCat("cmd_", name, "_sum_usec"), sum, {}, {}, &command_metrics);
-      AppendMetricValue(StrCat("cmd_", name, "_avg_usec"), static_cast<double>(sum) / calls, {}, {},
+      const auto calls = stat.first;
+      const auto duration_seconds = stat.second * 0.001;
+      AppendMetricValue("commands_total", calls, {"cmd"}, {name}, &command_metrics);
+      AppendMetricValue("commands_duration_seconds_total", duration_seconds, {"cmd"}, {name},
                         &command_metrics);
     }
     absl::StrAppend(&resp->body(), command_metrics);
@@ -1037,14 +1167,8 @@ static void RunStage(
 
 // Start saving a single snapshot of a multi-file dfly snapshot.
 // If shard is null, then this is the summary file.
-GenericError DoPartialSave(fs::path full_filename, const dfly::StringVec& scripts,
+GenericError DoPartialSave(const fs::path& full_filename, const dfly::StringVec& scripts,
                            RdbSnapshot* snapshot, EngineShard* shard) {
-  if (shard == nullptr) {
-    ExtendDfsFilename("summary", &full_filename);
-  } else {
-    ExtendDfsFilenameWithShard(shard->shard_id(), &full_filename);
-  }
-
   // Start rdb saving.
   SaveMode mode = shard == nullptr ? SaveMode::SUMMARY : SaveMode::SINGLE_SHARD;
   GenericError local_ec = snapshot->Start(mode, full_filename.string(), scripts);
@@ -1059,8 +1183,7 @@ GenericError DoPartialSave(fs::path full_filename, const dfly::StringVec& script
 GenericError ServerFamily::DoSave() {
   const CommandId* cid = service().FindCmd("SAVE");
   CHECK_NOTNULL(cid);
-  boost::intrusive_ptr<Transaction> trans(
-      new Transaction{cid, ServerState::tlocal()->thread_index()});
+  boost::intrusive_ptr<Transaction> trans(new Transaction{cid});
   trans->InitByArgs(0, {});
   return DoSave(absl::GetFlag(FLAGS_df_snapshot_format), {}, trans.get());
 }
@@ -1104,19 +1227,19 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
 
   shared_ptr<LastSaveInfo> save_info;
 
-  vector<unique_ptr<RdbSnapshot>> snapshots;
+  vector<pair<unique_ptr<RdbSnapshot>, fs::path>> snapshots;
   absl::flat_hash_map<string_view, size_t> rdb_name_map;
   Mutex mu;  // guards rdb_name_map
 
   auto save_cb = [&](unsigned index) {
-    auto& snapshot = snapshots[index];
+    auto& snapshot = snapshots[index].first;
     if (snapshot && snapshot->HasStarted()) {
       ec = snapshot->SaveBody();
     }
   };
 
   auto close_cb = [&](unsigned index) {
-    auto& snapshot = snapshots[index];
+    auto& snapshot = snapshots[index].first;
     if (snapshot) {
       ec = snapshot->Close();
 
@@ -1138,7 +1261,9 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
 
   fpath /= filename;
 
-  if (IsCloudPath(fpath.string())) {
+  const bool is_cloud = IsCloudPath(fpath.string());
+
+  if (is_cloud) {
     if (!aws_) {
       aws_ = make_unique<cloud::AWS>("s3");
       if (auto ec = aws_->Init(); ec) {
@@ -1153,16 +1278,29 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
   if (new_version) {
     // In the new version (.dfs) we store a file for every shard and one more summary file.
     // Summary file is always last in snapshots array.
-    snapshots.resize(shard_set->size() + 1);
+    const size_t sz = shard_set->size();
+    constexpr string_view ext = ".dfs.tmp"sv;
+    snapshots.resize(sz + 1);
+
+    // Set file names for shards
+    for (auto sid = 0u; sid < sz; ++sid) {
+      auto& filename = snapshots[sid].second;
+      filename = fpath;                                 // starts with fpath
+      ExtendDfsFilenameWithShard(sid, ext, &filename);  // later append -<shard id>.dfs.tmp
+    }
+
+    // Set summary file name
+    snapshots.back().second = fpath;
+    SetExtension("summary", ext, &snapshots.back().second);
 
     // Save summary file.
     {
       auto scripts = get_scripts();
-      auto& snapshot = snapshots[shard_set->size()];
+      auto& [snapshot, filename] = snapshots[sz];
       snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
 
       snapshot->SetAWS(aws_.get());
-      if (auto local_ec = DoPartialSave(fpath, scripts, snapshot.get(), nullptr); local_ec) {
+      if (auto local_ec = DoPartialSave(filename, scripts, snapshot.get(), nullptr); local_ec) {
         ec = local_ec;
         snapshot.reset();
       }
@@ -1170,10 +1308,10 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
 
     // Save shard files.
     auto cb = [&](Transaction* t, EngineShard* shard) {
-      auto& snapshot = snapshots[shard->shard_id()];
+      auto& [snapshot, filename] = snapshots[shard->shard_id()];
       snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
       snapshot->SetAWS(aws_.get());
-      if (auto local_ec = DoPartialSave(fpath, {}, snapshot.get(), shard); local_ec) {
+      if (auto local_ec = DoPartialSave(filename, {}, snapshot.get(), shard); local_ec) {
         ec = local_ec;
         snapshot.reset();
       }
@@ -1183,26 +1321,33 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
     trans->ScheduleSingleHop(std::move(cb));
   } else {
     snapshots.resize(1);
+    auto& [snapshot, filename] = snapshots[0];
 
     if (!fpath.has_extension()) {
       fpath += ".rdb";
     }
 
-    snapshots[0].reset(new RdbSnapshot(fq_threadpool_.get()));
+    // begin by saving as temp, and later rename to the actual target
+    fpath += ".tmp";
+
+    filename = fpath;
+
+    snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
     auto lua_scripts = get_scripts();
 
-    snapshots[0]->SetAWS(aws_.get());
-    ec = snapshots[0]->Start(SaveMode::RDB, fpath.string(), lua_scripts);
+    snapshot->SetAWS(aws_.get());
+    ec = snapshot->Start(SaveMode::RDB, filename,
+                         lua_scripts);  // filename == fpath, for consistency use filename
 
     if (!ec) {
       auto cb = [&](Transaction* t, EngineShard* shard) {
-        snapshots[0]->StartInShard(shard);
+        snapshot->StartInShard(shard);
         return OpStatus::OK;
       };
 
       trans->ScheduleSingleHop(std::move(cb));
     } else {
-      snapshots[0].reset();
+      snapshot.reset();
     }
   }
 
@@ -1219,8 +1364,9 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
   RunStage(new_version, close_cb, reset_event_cb);
 
   if (new_version) {
-    ExtendDfsFilename("summary", &fpath);
-  }
+    SetExtension("summary", ".dfs", &fpath);
+  } else
+    fpath.replace_extension();  // remove .tmp
 
   absl::Duration dur = absl::Now() - start;
   double seconds = double(absl::ToInt64Milliseconds(dur)) / 1000;
@@ -1229,6 +1375,15 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
   if (!ec) {
     LOG(INFO) << "Saving " << fpath << " finished after "
               << strings::HumanReadableElapsedTime(seconds);
+
+    if (!is_cloud)
+      for (const auto& [_, filename] : snapshots) {
+        auto copy = filename;
+        copy.replace_extension();
+
+        VLOG(1) << "snapshotting: rename " << filename.string() << " -> " << copy.string();
+        filesystem::rename(filename, copy);
+      }
 
     save_info = make_shared<LastSaveInfo>();
     for (const auto& k_v : rdb_name_map) {
@@ -1830,7 +1985,7 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
 
   if (should_enter("CLUSTER")) {
     ADD_HEADER("# Cluster");
-    append("cluster_enabled", cluster_family_->IsEnabledOrEmulated());
+    append("cluster_enabled", ClusterConfig::IsEnabledOrEmulated());
   }
 
   (*cntx)->SendBulkString(info);
@@ -1921,12 +2076,10 @@ void ServerFamily::Hello(CmdArgList args, ConnectionContext* cntx) {
   (*cntx)->SendBulkString((*ServerState::tlocal()).is_master ? "master" : "slave");
 }
 
-void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
-  std::string_view host = ArgS(args, 0);
-  std::string_view port_s = ArgS(args, 1);
+void ServerFamily::ReplicaOfInternal(string_view host, string_view port_sv, ConnectionContext* cntx,
+                                     ActionOnConnectionFail on_err) {
   auto& pool = service_.proactor_pool();
-
-  LOG(INFO) << "Replicating " << host << ":" << port_s;
+  LOG(INFO) << "Replicating " << host << ":" << port_sv;
 
   // We lock to protect global state changes that we perform during the replication setup:
   // The replica_ pointer, GlobalState, and the DB itself (we do a flushall txn before syncing).
@@ -1941,7 +2094,7 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
   VLOG(1) << "Acquire replica lock";
   unique_lock lk(replicaof_mu_);
 
-  if (absl::EqualsIgnoreCase(host, "no") && absl::EqualsIgnoreCase(port_s, "one")) {
+  if (IsReplicatingNoOne(host, port_sv)) {
     if (!ServerState::tlocal()->is_master) {
       auto repl_ptr = replica_;
       CHECK(repl_ptr);
@@ -1952,12 +2105,15 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
       replica_.reset();
     }
 
+    CHECK(service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE) == GlobalState::ACTIVE)
+        << "Server is set to replica no one, yet state is not active!";
+
     return (*cntx)->SendOk();
   }
 
   uint32_t port;
 
-  if (!absl::SimpleAtoi(port_s, &port) || port < 1 || port > 65535) {
+  if (!absl::SimpleAtoi(port_sv, &port) || port < 1 || port > 65535) {
     (*cntx)->SendError(kInvalidIntErr);
     return;
   }
@@ -1979,20 +2135,20 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
     return;
   }
 
-  // Flushing all the data after we marked this instance as replica.
-  Transaction* transaction = cntx->transaction;
-  transaction->Schedule();
-
-  auto cb = [](Transaction* t, EngineShard* shard) {
-    shard->db_slice().FlushDb(DbSlice::kDbAll);
-    return OpStatus::OK;
-  };
-  transaction->Execute(std::move(cb), true);
-
   // Replica sends response in either case. No need to send response in this function.
   // It's a bit confusing but simpler.
   lk.unlock();
-  error_code ec = new_replica->Start(cntx);
+  error_code ec{};
+
+  switch (on_err) {
+    case ActionOnConnectionFail::kReturnOnError:
+      ec = new_replica->Start(cntx);
+      break;
+    case ActionOnConnectionFail::kContinueReplication:  // set DF to replicate, and forget about it
+      new_replica->EnableReplication(cntx);
+      break;
+  };
+
   VLOG(1) << "Acquire replica lock";
   lk.lock();
 
@@ -2001,12 +2157,36 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
   if (replica_ == new_replica) {
     if (ec) {
       service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
+      replica_->Stop();
       replica_.reset();
     }
     bool is_master = !replica_;
     pool.AwaitFiberOnAll(
         [&](util::ProactorBase* pb) { ServerState::tlocal()->is_master = is_master; });
+  } else {
+    new_replica->Stop();
   }
+}
+
+void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
+  string_view host = ArgS(args, 0);
+  string_view port = ArgS(args, 1);
+
+  // don't flush if input is NO ONE
+  if (!IsReplicatingNoOne(host, port))
+    Drakarys(cntx->transaction, DbSlice::kDbAll);
+
+  ReplicaOfInternal(host, port, cntx, ActionOnConnectionFail::kReturnOnError);
+}
+
+void ServerFamily::Replicate(string_view host, string_view port) {
+  io::NullSink sink;
+  ConnectionContext ctxt{&sink, nullptr};
+
+  // we don't flush the database as the context is null
+  // (and also because there is nothing to flush)
+
+  ReplicaOfInternal(host, port, &ctxt, ActionOnConnectionFail::kContinueReplication);
 }
 
 void ServerFamily::ReplTakeOver(CmdArgList args, ConnectionContext* cntx) {

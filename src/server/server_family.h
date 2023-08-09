@@ -92,8 +92,7 @@ class ServerFamily {
   explicit ServerFamily(Service* service);
   ~ServerFamily();
 
-  void Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners,
-            ClusterFamily* cluster_family);
+  void Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners);
   void Register(CommandRegistry* registry);
   void Shutdown();
 
@@ -164,6 +163,9 @@ class ServerFamily {
   bool AwaitDispatches(absl::Duration timeout,
                        const std::function<bool(util::Connection*)>& filter);
 
+  // Sets the server to replicate another instance. Does not flush the database beforehand!
+  void Replicate(std::string_view host, std::string_view port);
+
  private:
   uint32_t shard_count() const {
     return shard_set->size();
@@ -193,10 +195,20 @@ class ServerFamily {
 
   void SyncGeneric(std::string_view repl_master_id, uint64_t offs, ConnectionContext* cntx);
 
-  // Returns the number of loaded keys if successfull.
+  enum ActionOnConnectionFail {
+    kReturnOnError,        // if we fail to connect to master, return to err
+    kContinueReplication,  // continue attempting to connect to master, regardless of initial
+                           // failure
+  };
+
+  // REPLICAOF implementation. See arguments above
+  void ReplicaOfInternal(std::string_view host, std::string_view port, ConnectionContext* cntx,
+                         ActionOnConnectionFail on_error);
+
+  // Returns the number of loaded keys if successful.
   io::Result<size_t> LoadRdb(const std::string& rdb_file);
 
-  void SnapshotScheduling(const SnapshotSpec& time);
+  void SnapshotScheduling();
 
   Fiber snapshot_schedule_fb_;
   Future<std::error_code> load_result_;
@@ -214,7 +226,6 @@ class ServerFamily {
   std::unique_ptr<ScriptMgr> script_mgr_;
   std::unique_ptr<journal::Journal> journal_;
   std::unique_ptr<DflyCmd> dfly_cmd_;
-  ClusterFamily* cluster_family_ = nullptr;  // Not owned
 
   std::string master_id_;
 

@@ -1666,8 +1666,7 @@ void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
   // entries.
   if (opts.timeout == -1 || cntx->transaction->IsMulti()) {
     // Close the transaction and release locks.
-    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-    cntx->transaction->Execute(std::move(close_cb), true);
+    cntx->transaction->Conclude();
     return (*cntx)->SendNullArray();
   }
 
@@ -1735,8 +1734,7 @@ void XReadImpl(CmdArgList args, std::optional<ReadOpts> opts, ConnectionContext*
   auto last_ids = StreamLastIDs(cntx->transaction);
   if (!last_ids) {
     // Close the transaction.
-    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-    cntx->transaction->Execute(std::move(close_cb), true);
+    cntx->transaction->Conclude();
 
     if (last_ids.status() == OpStatus::WRONG_TYPE) {
       (*cntx)->SendError(kWrongTypeErr);
@@ -2010,7 +2008,7 @@ void StreamFamily::XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext
 void StreamFamily::Register(CommandRegistry* registry) {
   using CI = CommandId;
 
-  *registry << CI{"XADD", CO::WRITE | CO::FAST, -5, 1, 1, 1}.HFUNC(XAdd)
+  *registry << CI{"XADD", CO::WRITE | CO::DENYOOM | CO::FAST, -5, 1, 1, 1}.HFUNC(XAdd)
             << CI{"XDEL", CO::WRITE | CO::FAST, -3, 1, 1, 1}.HFUNC(XDel)
             << CI{"XGROUP", CO::WRITE | CO::DENYOOM, -3, 2, 2, 1}.HFUNC(XGroup)
             << CI{"XINFO", CO::READONLY | CO::NOSCRIPT, -2, 0, 0, 0}.HFUNC(XInfo)
@@ -2021,7 +2019,7 @@ void StreamFamily::Register(CommandRegistry* registry) {
                    .HFUNC(XRead)
             << CI{"XREADGROUP", CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -6, 6, 6, 1}
                    .HFUNC(XReadGroup)
-            << CI{"XSETID", CO::WRITE | CO::DENYOOM, 3, 1, 1, 1}.HFUNC(XSetId)
+            << CI{"XSETID", CO::WRITE, 3, 1, 1, 1}.HFUNC(XSetId)
             << CI{"XTRIM", CO::WRITE | CO::FAST, -4, 1, 1, 1}.HFUNC(XTrim)
             << CI{"_XGROUP_HELP", CO::NOSCRIPT | CO::HIDDEN, 2, 0, 0, 0}.SetHandler(XGroupHelp);
 }
